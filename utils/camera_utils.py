@@ -9,10 +9,10 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from scene.cameras import Camera
+from ants.gaussiansplatting.scene.cameras import Camera
 import numpy as np
-from utils.general_utils import PILtoTorch
-from utils.graphics_utils import fov2focal
+from ants.gaussiansplatting.utils.general_utils import PILtoTorch
+from ants.gaussiansplatting.utils.graphics_utils import fov2focal
 
 WARNED = False
 
