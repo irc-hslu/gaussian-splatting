@@ -11,15 +11,14 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from ants.gaussiansplatting.utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
-from utils.system_utils import mkdir_p
+from ants.gaussiansplatting.utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
-from simple_knn._C import distCUDA2
-from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
+from ants.gaussiansplatting.utils.sh_utils import RGB2SH
+from ants.gaussiansplatting.utils.graphics_utils import BasicPointCloud
+from ants.gaussiansplatting.utils.general_utils import strip_symmetric, build_scaling_rotation
 
 class GaussianModel:
 
@@ -122,6 +121,8 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+        from simple_knn._C import distCUDA2
+
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
