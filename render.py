@@ -14,12 +14,12 @@ from scene import Scene
 import os
 from tqdm import tqdm
 from os import makedirs
-from gaussian_renderer import render
 import torchvision
-from utils.general_utils import safe_state
 from argparse import ArgumentParser
-from arguments import ModelParams, PipelineParams, get_combined_args
-from gaussian_renderer import GaussianModel
+from ants.gaussiansplatting.gaussian_renderer import render
+from ants.gaussiansplatting.utils.general_utils import safe_state
+from ants.gaussiansplatting.arguments import ModelParams, PipelineParams, get_combined_args
+from ants.gaussiansplatting.scene.gaussian_model import GaussianModel
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
