@@ -12,7 +12,7 @@
 import torch
 import numpy as np
 from ants.gaussiansplatting.utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
-from torch import nn
+from torch import nn, Tensor
 import os
 from ants.gaussiansplatting.utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -106,6 +106,8 @@ class GaussianModel:
     @property
     def get_features(self):
         features_dc = self._features_dc
+        if features_dc.ndim == 2:
+            features_dc = RGB2SH(features_dc).unsqueeze(-2)
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
 
@@ -179,9 +181,9 @@ class GaussianModel:
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         # All channels except the 3 DC
-        for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
+        for i in range(np.prod(self._features_dc.shape[1:])):
             l.append('f_dc_{}'.format(i))
-        for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
+        for i in range(15 * 3):
             l.append('f_rest_{}'.format(i))
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
@@ -195,8 +197,14 @@ class GaussianModel:
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_dc = self._features_dc.detach().view(self._features_dc.shape[0], 1, 3).flatten(
+            start_dim=1).contiguous().cpu().numpy()
+        if self.max_sh_degree == 0:
+            f_dc = RGB2SH(f_dc)
+        if self.max_sh_degree == 0:
+            f_rest = np.zeros((self._xyz.shape[0], 3 * 15))
+        else:
+            f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
@@ -298,9 +306,19 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-    def prune_points(self, mask):
+    def prune_points(self, mask, adc_fix: bool = True):
         valid_points_mask = ~mask
-        optimizable_tensors = self._prune_optimizer(valid_points_mask)
+        if adc_fix:
+            optimizable_tensors = self._prune_optimizer(valid_points_mask)
+        else:
+            optimizable_tensors = dict(
+                xyz=self._xyz[valid_points_mask],
+                f_dc=self._features_dc[valid_points_mask],
+                f_rest=self._features_rest[valid_points_mask],
+                opacity=self._opacity[valid_points_mask],
+                scaling=self._scaling[valid_points_mask],
+                rotation=self._rotation[valid_points_mask],
+            )
 
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
@@ -310,7 +328,6 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
@@ -322,16 +339,20 @@ class GaussianModel:
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
 
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
+                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)),
+                                                    dim=0)
+                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
+                                                       dim=0)
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(
+                    torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(
+                    torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
@@ -366,6 +387,7 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling,
                                                         dim=1).values > self.percent_dense * scene_extent)
+        print(f'splitting {selected_pts_mask.sum()} points')
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
@@ -390,6 +412,7 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling,
                                                         dim=1).values <= self.percent_dense * scene_extent)
+        print(f'cloning {selected_pts_mask.sum()} points')
 
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -413,11 +436,53 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        print(f'pruning {prune_mask.sum()} points')
         self.prune_points(prune_mask)
-
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1,
                                                              keepdim=True)
         self.denom[update_filter] += 1
+
+    def add_smpl(self, smpl_verts: Tensor, adc_fix: bool = True, inplace: bool = False) -> None:
+        # @formatter:off
+        if inplace:
+            for group in self.optimizer.param_groups:
+                if group["name"] != 'xyz':
+                    continue
+                stored_state = self.optimizer.state.get(group['params'][0], None)
+                if stored_state is not None:
+                    del self.optimizer.state[group['params'][0]]
+                    group["params"][0] = nn.Parameter(torch.cat(
+                        (self._xyz.data[:-len(smpl_verts)], smpl_verts), dim=0
+                    ).requires_grad_(True))
+                    self.optimizer.state[group['params'][0]] = stored_state
+                else:
+                    group["params"][0] = nn.Parameter(torch.cat(
+                        (self._xyz.data[:-len(smpl_verts)], smpl_verts), dim=0
+                    ).requires_grad_(True))
+                self._xyz = group["params"][0]
+        else:
+            new_xyz = smpl_verts
+            new_opacities = torch.ones(len(smpl_verts), 1).to(self._opacity)
+            new_scaling = self._scaling.mean() * torch.ones(len(smpl_verts), 3).to(self._scaling)
+            new_rotation = torch.tensor([[1, 0, 0, 0]]).repeat_interleave(len(smpl_verts), dim=0).to(self._rotation)
+            new_features_dc = torch.tensor([[1.0, 0.036, 0.265]]).repeat_interleave(len(smpl_verts), dim=0).to(self._features_dc)
+            new_features_rest = torch.zeros(len(smpl_verts), *self._features_rest.shape[-2:]).to(self._features_rest)
+            if adc_fix:
+                self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+            else:
+                self._xyz.data = torch.cat((self._xyz, new_xyz), dim=0)
+                self._features_dc.data = torch.cat((self._features_dc, new_features_dc), dim=0)
+                self._features_rest.data = torch.cat((self._features_rest, new_features_rest), dim=0)
+                self._opacity.data = torch.cat((self._opacity, new_opacities), dim=0)
+                self._scaling.data = torch.cat((self._scaling, new_scaling), dim=0)
+                self._rotation.data = torch.cat((self._rotation, new_rotation), dim=0)
+        # @formatter:on
+
+    # def remove_smpl(self, smpl_verts: Tensor, adc_fix: bool = True) -> None:
+    #     prune_mask = torch.ones(len(self._opacity)).to(dtype=torch.bool, device=self._xyz.device).squeeze()
+    #     prune_mask[:-len(smpl_verts)] = False
+    #     self.prune_points(prune_mask, adc_fix=adc_fix)
+    #     torch.cuda.empty_cache()
